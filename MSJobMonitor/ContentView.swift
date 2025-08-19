@@ -1,5 +1,3 @@
-// MicrosoftJobMonitor.swift
-
 import SwiftUI
 import UserNotifications
 import AppKit
@@ -53,17 +51,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         setupStatusBar()
         requestNotificationPermission()
         
-        // Set notification delegate
         UNUserNotificationCenter.current().delegate = self
         
-        // Start monitoring jobs
         Task {
             await JobManager.shared.startMonitoring()
         }
     }
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return false // Keep app running when window is closed
+        return false
     }
     
     func setupStatusBar() {
@@ -96,7 +92,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let userInfo = response.notification.request.content.userInfo
         if let jobId = userInfo["jobId"] as? String {
-            // Open app and show job detail
             NSApplication.shared.activate(ignoringOtherApps: true)
             if let window = NSApplication.shared.windows.first {
                 window.makeKeyAndOrderFront(nil)
@@ -120,8 +115,9 @@ struct Job: Identifiable, Codable, Equatable {
     let description: String
     let workSiteFlexibility: String?
     
-    var isToday: Bool {
-        Calendar.current.isDateInToday(postingDate)
+    var isWithin24Hours: Bool {
+        let hoursSincePosting = Date().timeIntervalSince(postingDate) / 3600
+        return hoursSincePosting <= 24 && hoursSincePosting >= 0
     }
     
     var cleanDescription: String {
@@ -151,14 +147,19 @@ class JobManager: ObservableObject {
     
     @Published var jobs: [Job] = []
     @Published var isLoading = false
+    @Published var loadingProgress = ""
     @Published var showSettings = false
     @Published var lastError: String?
     @Published var selectedJob: Job?
     @Published var selectedTab = "jobs"
+    @Published var totalFetchedCount = 0
+    @Published var filteredCount = 0
+    @Published var totalAvailableJobs = 0
     
     @AppStorage("jobTitleFilter") var jobTitleFilter = ""
     @AppStorage("locationFilter") var locationFilter = ""
     @AppStorage("refreshInterval") var refreshInterval = 30.0 // minutes
+    @AppStorage("maxPagesToFetch") var maxPagesToFetch = 5
     
     private var timer: Timer?
     private var storedJobIds: Set<String> = []
@@ -178,7 +179,7 @@ class JobManager: ObservableObject {
     func startMonitoring() async {
         await fetchJobs()
         
-        // Setup timer for periodic fetching
+        // Setup timer
         await MainActor.run {
             timer?.invalidate()
             timer = Timer.scheduledTimer(withTimeInterval: refreshInterval * 60, repeats: true) { _ in
@@ -197,27 +198,42 @@ class JobManager: ObservableObject {
             let fetcher = MicrosoftJobFetcher()
             let fetchedJobs = try await fetcher.fetchJobs(
                 titleKeywords: jobTitleFilter.isEmpty ? [] : [jobTitleFilter],
-                location: locationFilter
+                location: locationFilter,
+                maxPages: Int(maxPagesToFetch)
             )
             
-            // Filter for today's jobs only
-            let todayJobs = fetchedJobs.filter { $0.isToday }
+            totalFetchedCount = fetchedJobs.count
+            print("Fetched \(fetchedJobs.count) total unique jobs from API")
             
-            // Check for new jobs
-            var newJobs: [Job] = []
-            for job in todayJobs {
-                if !storedJobIds.contains(job.id) {
-                    newJobs.append(job)
-                    storedJobIds.insert(job.id)
+            let recentJobs = fetchedJobs.filter { $0.isWithin24Hours }
+            
+            filteredCount = recentJobs.count
+            print("Filtered to \(recentJobs.count) jobs from last 24 hours")
+            
+            // Additional deduplication check for the final list
+            var uniqueJobs: [Job] = []
+            var seenIds = Set<String>()
+            
+            for job in recentJobs.sorted(by: { $0.postingDate > $1.postingDate }) {
+                if !seenIds.contains(job.id) {
+                    uniqueJobs.append(job)
+                    seenIds.insert(job.id)
+                    
+                    // Check if this is a new job for notifications
+                    if !storedJobIds.contains(job.id) {
+                        storedJobIds.insert(job.id)
+                    }
                 }
             }
             
             // Send grouped notification if there are new jobs
+            let newJobs = uniqueJobs.filter { !storedJobIds.contains($0.id) }
             if !newJobs.isEmpty {
                 sendGroupedNotification(for: newJobs)
+                newJobs.forEach { storedJobIds.insert($0.id) }
             }
             
-            jobs = todayJobs.sorted { $0.postingDate > $1.postingDate }
+            jobs = uniqueJobs
             saveJobs()
             saveStoredJobIds()
             
@@ -251,7 +267,7 @@ class JobManager: ObservableObject {
             // Multiple jobs - grouped notification
             let content = UNMutableNotificationContent()
             content.title = "\(newJobs.count) New Jobs Posted"
-            content.subtitle = "Microsoft Careers"
+            content.subtitle = "Microsoft Careers (Last 24h)"
             
             let jobTitles = newJobs.prefix(3).map { "• \($0.title)" }.joined(separator: "\n")
             let moreText = newJobs.count > 3 ? "\n...and \(newJobs.count - 3) more" : ""
@@ -304,6 +320,7 @@ class JobManager: ObservableObject {
         do {
             let data = try Data(contentsOf: jobsURL)
             jobs = try JSONDecoder().decode([Job].self, from: data)
+            filteredCount = jobs.count
         } catch {
             print("Failed to load jobs: \(error)")
         }
@@ -333,46 +350,142 @@ class JobManager: ObservableObject {
 actor MicrosoftJobFetcher {
     private let baseURL = "https://gcsservices.careers.microsoft.com/search/api/v1/search"
     
-    func fetchJobs(titleKeywords: [String], location: String) async throws -> [Job] {
-        var components = URLComponents(string: baseURL)!
+    func fetchJobs(titleKeywords: [String], location: String, maxPages: Int = 5) async throws -> [Job] {
+        var allJobs: [Job] = []
+        var seenJobIds = Set<String>()
+        var currentPage = 1
+        let pageLimit = min(maxPages, 20) // Cap at 20 pages
         
-        var queryValue = titleKeywords.joined(separator: " ")
-        if !location.isEmpty {
-            queryValue += " \(location)"
+        while currentPage <= pageLimit {
+            // Update progress on main thread
+            await MainActor.run {
+                JobManager.shared.loadingProgress = "Fetching page \(currentPage) of \(pageLimit)..."
+            }
+            
+            var components = URLComponents(string: baseURL)!
+            
+            var queryValue = titleKeywords.joined(separator: " ")
+            if !location.isEmpty {
+                queryValue += " \(location)"
+            }
+            
+            components.queryItems = [
+                URLQueryItem(name: "l", value: "en_us"),
+                URLQueryItem(name: "pg", value: String(currentPage)),
+                URLQueryItem(name: "pgSz", value: "20"),
+                URLQueryItem(name: "o", value: "Relevance"),
+                URLQueryItem(name: "flt", value: "true")
+            ]
+            
+            if !queryValue.isEmpty {
+                components.queryItems?.append(URLQueryItem(name: "q", value: queryValue))
+            }
+            
+            print("Fetching URL: \(components.url?.absoluteString ?? "nil")")
+            
+            var request = URLRequest(url: components.url!)
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            guard let httpResponse = response as? HTTPURLResponse else {
+                print("Response is not HTTP response")
+                throw FetchError.invalidResponse
+            }
+            
+            if httpResponse.statusCode != 200 {
+                print("HTTP Error: Status code \(httpResponse.statusCode)")
+                if let errorString = String(data: data, encoding: .utf8) {
+                    print("Error response: \(errorString.prefix(500))")
+                }
+                throw FetchError.invalidResponse
+            }
+            
+            let pageJobs = try parseResponse(data, page: currentPage)
+            
+            // Deduplicate jobs
+            let uniquePageJobs = pageJobs.filter { job in
+                if seenJobIds.contains(job.id) {
+                    print("Skipping duplicate job: \(job.id) - \(job.title)")
+                    return false
+                }
+                seenJobIds.insert(job.id)
+                return true
+            }
+            
+            let recentJobsInPage = uniquePageJobs.filter { job in
+                let hoursSincePosting = Date().timeIntervalSince(job.postingDate) / 3600
+                return hoursSincePosting <= 24 && hoursSincePosting >= 0
+            }
+            
+            allJobs.append(contentsOf: uniquePageJobs)
+            
+            if recentJobsInPage.isEmpty && allJobs.contains(where: { job in
+                let hours = Date().timeIntervalSince(job.postingDate) / 3600
+                return hours <= 24 && hours >= 0
+            }) {
+                print("No recent jobs in page \(currentPage), stopping pagination")
+                break
+            }
+            
+            if pageJobs.count < 20 {
+                break
+            }
+            
+            currentPage += 1
+            
+            // Small delay to be nice to the API
+            try await Task.sleep(nanoseconds: 300_000_000) // 0.3 seconds
         }
         
-        components.queryItems = [
-            URLQueryItem(name: "l", value: "en_us"),
-            URLQueryItem(name: "pg", value: "1"),
-            URLQueryItem(name: "pgSz", value: "100"),
-            URLQueryItem(name: "o", value: "Relevance"),
-            URLQueryItem(name: "flt", value: "true"),
-            URLQueryItem(name: "q", value: queryValue)
-        ]
-        
-        var request = URLRequest(url: components.url!)
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw FetchError.invalidResponse
+        await MainActor.run {
+            JobManager.shared.loadingProgress = ""
         }
         
-        return try parseResponse(data)
+        let pagesFetched = min(currentPage, pageLimit)
+        print("Total unique jobs fetched across \(pagesFetched) page(s): \(allJobs.count)")
+        return allJobs
     }
     
-    private func parseResponse(_ data: Data) throws -> [Job] {
+    private func parseResponse(_ data: Data, page: Int = 1) throws -> [Job] {
+        // Log raw JSON for debugging
+        if let jsonString = String(data: data, encoding: .utf8) {
+            print("=== MICROSOFT API RESPONSE (first 2000 chars) ===")
+            let truncated = String(jsonString.prefix(2000))
+            print(truncated)
+            print("=== END RESPONSE SAMPLE ===")
+        }
+        
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         
         let response = try decoder.decode(MSResponse.self, from: data)
         
+        print("\nTotal jobs found: \(response.operationResult.result.jobs.count)")
+        
+        // Log first job
+        if let firstJob = response.operationResult.result.jobs.first {
+            print("\n=== FIRST JOB DETAILS ===")
+            print("Title: \(firstJob.title)")
+            print("JobId: \(firstJob.jobId)")
+            print("PostingDate: \(firstJob.postingDate)")
+            print("Properties exists: \(firstJob.properties != nil)")
+            if let props = firstJob.properties {
+                print("  Location exists: \(props.location != nil)")
+                if let loc = props.location {
+                    print("    City: \(loc.city ?? "nil")")
+                    print("    State: \(loc.state ?? "nil")")
+                    print("    Country: \(loc.country ?? "nil")")
+                }
+                print("  WorkSiteFlexibility: \(props.workSiteFlexibility ?? "nil")")
+                print("  Description length: \(props.description?.count ?? 0) chars")
+            }
+            print("========================")
+        }
+        
         return response.operationResult.result.jobs.map { msJob in
-            // Build location string properly
             var locationComponents: [String] = []
             
             if let city = msJob.properties?.location?.city, !city.isEmpty {
@@ -385,18 +498,26 @@ actor MicrosoftJobFetcher {
                 locationComponents.append(country)
             }
             
-            // Check for remote/hybrid
+            // Check for remote/hybrid in workSiteFlexibility
             let workSiteFlexibility = msJob.properties?.workSiteFlexibility ?? ""
-            let isRemote = workSiteFlexibility.lowercased().contains("work from home") ||
-                          workSiteFlexibility.lowercased().contains("100%")
-            let isHybrid = workSiteFlexibility.lowercased().contains("50%") ||
-                          workSiteFlexibility.lowercased().contains("hybrid")
+            let hasRemoteOption = workSiteFlexibility.lowercased().contains("work from home") ||
+                                 workSiteFlexibility.lowercased().contains("100%") ||
+                                 workSiteFlexibility.lowercased().contains("remote")
+            let hasHybridOption = workSiteFlexibility.lowercased().contains("50%") ||
+                                 workSiteFlexibility.lowercased().contains("hybrid")
             
-            var location = locationComponents.joined(separator: ", ")
-            if location.isEmpty || isRemote {
+            var location: String
+            if !locationComponents.isEmpty {
+                location = locationComponents.joined(separator: ", ")
+                if hasHybridOption {
+                    location += " (Hybrid)"
+                } else if hasRemoteOption {
+                    location += " (Remote option available)"
+                }
+            } else if hasRemoteOption {
                 location = "Remote"
-            } else if isHybrid {
-                location = "\(location) (Hybrid)"
+            } else {
+                location = "Location not specified"
             }
             
             return Job(
@@ -429,6 +550,7 @@ struct OperationResult: Codable {
 
 struct SearchResult: Codable {
     let jobs: [MSJob]
+    let totalJobs: Int?
 }
 
 struct MSJob: Codable {
@@ -496,13 +618,32 @@ struct ContentView: View {
                 Spacer()
                 
                 if jobManager.isLoading {
-                    ProgressView()
-                        .scaleEffect(0.8)
+                    VStack(spacing: 4) {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                        if !jobManager.loadingProgress.isEmpty {
+                            Text(jobManager.loadingProgress)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
                 }
                 
-                Text("\(jobManager.jobs.count) jobs today")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                VStack(spacing: 4) {
+                    Text("\(jobManager.jobs.count) jobs (24h)")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    if jobManager.totalFetchedCount > jobManager.filteredCount {
+                        Text("(\(jobManager.totalFetchedCount) fetched)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    if jobManager.totalAvailableJobs > 0 {
+                        Text("\(jobManager.totalAvailableJobs) available")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
             }
             .padding()
             .frame(width: 200)
@@ -553,7 +694,7 @@ struct JobListView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack {
-                Text("Today's Jobs")
+                Text("Jobs (Last 24 Hours)")
                     .font(.title2)
                     .fontWeight(.semibold)
                 
@@ -574,14 +715,21 @@ struct JobListView: View {
             
             // Jobs list
             if jobManager.jobs.isEmpty && !jobManager.isLoading {
-                VStack {
+                VStack(spacing: 8) {
                     Spacer()
                     Image(systemName: "tray")
                         .font(.system(size: 50))
                         .foregroundColor(.secondary)
-                    Text("No jobs posted today")
+                    Text("No jobs posted in last 24 hours")
                         .font(.title3)
                         .foregroundColor(.secondary)
+                    
+                    if jobManager.totalFetchedCount > 0 {
+                        Text("(\(jobManager.totalFetchedCount) jobs found, but none from last 24h)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    
                     Text("Check your filters in Settings")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -775,6 +923,7 @@ struct SettingsView: View {
     @State private var titleFilter = ""
     @State private var locationFilter = ""
     @State private var refreshInterval = 30.0
+    @State private var maxPagesToFetch = 5.0
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -795,7 +944,7 @@ struct SettingsView: View {
                         .help("Enter location to filter jobs (e.g., 'Seattle' or 'Remote')")
                 }
                 
-                Section("Refresh Settings") {
+                Section("Fetch Settings") {
                     HStack {
                         Text("Check for new jobs every")
                         TextField("", value: $refreshInterval, format: .number)
@@ -803,6 +952,16 @@ struct SettingsView: View {
                             .textFieldStyle(.roundedBorder)
                         Text("minutes")
                     }
+                    
+                    HStack {
+                        Text("Fetch up to")
+                        TextField("", value: $maxPagesToFetch, format: .number)
+                            .frame(width: 60)
+                            .textFieldStyle(.roundedBorder)
+                        Text("pages (\(Int(maxPagesToFetch) * 20) jobs)")
+                            .foregroundColor(.secondary)
+                    }
+                    .help("Each page contains 20 jobs. More pages = longer fetch time")
                 }
                 
                 Section {
@@ -832,6 +991,7 @@ struct SettingsView: View {
             titleFilter = jobManager.jobTitleFilter
             locationFilter = jobManager.locationFilter
             refreshInterval = jobManager.refreshInterval
+            maxPagesToFetch = Double(jobManager.maxPagesToFetch)
         }
     }
     
@@ -839,6 +999,7 @@ struct SettingsView: View {
         jobManager.jobTitleFilter = titleFilter
         jobManager.locationFilter = locationFilter
         jobManager.refreshInterval = refreshInterval
+        jobManager.maxPagesToFetch = Int(maxPagesToFetch)
         
         Task {
             await jobManager.startMonitoring()
